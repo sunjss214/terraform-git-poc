@@ -1,0 +1,11 @@
+# 테라폼 실행 시 생성되는 로컬 상태 파일들 (보안 및 충돌 방지)
+*.tfstate
+*.tfstate.backup
+.terraform/
+*.tfvars
+
+# 로그 파일 및 개인 설정 파일
+*.log
+.terraform.lock.hcl
+
+
