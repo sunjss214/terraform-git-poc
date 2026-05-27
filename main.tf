@@ -1,266 +1,269 @@
 
-
-# [1] 공급자 설정
 provider "aws" {
-  region = "ap-northeast-2"
+region = "ap-northeast-2"
 }
 
-# [2] 네트워크 기초 (VPC & IGW)
-resource "aws_vpc" "main" {
-  cidr_block           = "10.0.0.0/16"
-  enable_dns_hostnames = true
-  tags                 = { Name = "3tier-vpc" }
+# ==========================================
+
+# [1] 완벽히 격리된 VPC & 서브넷 (3-Tier 구조)
+
+# ==========================================
+
+resource "aws_vpc" "poc_vpc" {
+cidr_block           = "10.0.0.0/16"
+enable_dns_hostnames = true
+enable_dns_support   = true
+tags                 = { Name = "3tier-standard-vpc" }
 }
 
-resource "aws_internet_gateway" "igw" {
-  vpc_id = aws_vpc.main.id
-  tags   = { Name = "3tier-igw" }
+resource "aws_internet_gateway" "poc_igw" {
+vpc_id = aws_vpc.poc_vpc.id
+tags   = { Name = "standard-igw" }
 }
 
-# [3] 서브넷 설계 (영역별 분리)
-# 3-1. Web+App Zone (Public)
-resource "aws_subnet" "pub_web" {
-  vpc_id                  = aws_vpc.main.id
-  cidr_block              = "10.0.1.0/24"
-  availability_zone       = "ap-northeast-2a"
-  map_public_ip_on_launch = true
-  tags                    = { Name = "subnet-web-pub" }
+# A. 외부와 통신할 Public 서브넷 (앱/웹서버 또는 Bastion용)
+
+resource "aws_subnet" "pub_a" {
+vpc_id            = aws_vpc.poc_vpc.id
+cidr_block        = "10.0.1.0/24"
+availability_zone = "ap-northeast-2a"
+map_public_ip_on_launch = true
+tags              = { Name = "standard-pub-subnet-a" }
 }
 
-# 3-2. Transaction Zone (Private)
-resource "aws_subnet" "pri_trans" {
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = "10.0.2.0/24"
-  availability_zone = "ap-northeast-2a"
-  tags              = { Name = "subnet-trans-pri" }
+# B. RDS 데이터베이스가 숨겨질 진짜 Private 서브넷 (★핵심)
+
+resource "aws_subnet" "db_pri_a" {
+vpc_id            = aws_vpc.poc_vpc.id
+cidr_block        = "10.0.11.0/24"
+availability_zone = "ap-northeast-2a"
+map_public_ip_on_launch = false # 공인 IP 절대 발급 안 함
+tags              = { Name = "standard-db-private-subnet-a" }
 }
 
-# 3-3. DB Zone (Private - RDS용 2개 AZ)
-resource "aws_subnet" "pri_db_a" {
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = "10.0.3.0/24"
-  availability_zone = "ap-northeast-2a"
-  tags              = { Name = "subnet-db-pri-a" }
+resource "aws_subnet" "db_pri_c" {
+vpc_id            = aws_vpc.poc_vpc.id
+cidr_block        = "10.0.12.0/24"
+availability_zone = "ap-northeast-2c"
+map_public_ip_on_launch = false # 공인 IP 절대 발급 안 함
+tags              = { Name = "standard-db-private-subnet-c" }
 }
 
-resource "aws_subnet" "pri_db_c" {
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = "10.0.4.0/24"
-  availability_zone = "ap-northeast-2c"
-  tags              = { Name = "subnet-db-pri-c" }
-}
+# Public 서브넷만 인터넷 대문과 연결
 
-# [4] 라우팅 설정 (Public만 외부와 통신 가능하게)
 resource "aws_route_table" "pub_rt" {
-  vpc_id = aws_vpc.main.id
-  route {
-    cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.igw.id
+vpc_id = aws_vpc.poc_vpc.id
+route {
+cidr_block = "0.0.0.0/0"
+gateway_id = aws_internet_gateway.poc_igw.id
+}
+tags = { Name = "standard-public-rt" }
+}
+
+resource "aws_route_table_association" "pub_a_assoc" {
+subnet_id      = aws_subnet.pub_a.id
+route_table_id = aws_route_table.pub_rt.id
+}
+
+# DB Private 서브넷용 라우팅 테이블 (인터넷 연결 통로 없음 = 격리)
+
+resource "aws_route_table" "db_pri_rt" {
+vpc_id = aws_vpc.poc_vpc.id
+tags   = { Name = "standard-db-private-rt" }
+}
+
+resource "aws_route_table_association" "db_a_assoc" {
+subnet_id      = aws_subnet.db_pri_a.id
+route_table_id = aws_route_table.db_pri_rt.id
+}
+
+resource "aws_route_table_association" "db_c_assoc" {
+subnet_id      = aws_subnet.db_pri_c.id
+route_table_id = aws_route_table.db_pri_rt.id
+}
+
+# DB 서브넷 그룹 정의 (Private 영역 2개 묶음)
+
+resource "aws_db_subnet_group" "poc_db_group" {
+name       = "standard-db-subnet-group"
+subnet_ids = [aws_subnet.db_pri_a.id, aws_subnet.db_pri_c.id]
+tags       = { Name = "standard-db-subnet-group" }
+}
+
+# ==========================================
+
+# [2] 가상의 백엔드 서버 방패 (보안 그룹 체이닝용)
+
+# ==========================================
+
+resource "aws_security_group" "was_sg" {
+name        = "standard-was-sg"
+vpc_id      = aws_vpc.poc_vpc.id
+description = "Security Group for Backend WAS"
+tags        = { Name = "was-security-group" }
+}
+
+# ==========================================
+
+# [3] RDS 전용 보안 그룹 (수정 버전)
+
+# ==========================================
+
+resource "aws_security_group" "rds_sg" {
+name        = "standard-rds-sg"
+vpc_id      = aws_vpc.poc_vpc.id
+description = "Allow MySQL traffic from authorized sources"
+
+# 규칙 1: 향후 이 VPC 내부에 태어날 WAS 서버들의 접근 허용 (보안 그룹 체이닝)
+
+ingress {
+from_port       = 3306
+to_port         = 3306
+protocol        = "tcp"
+security_groups = [aws_security_group.was_sg.id]
+description     = "Allow access from WAS Security Group"
+}
+
+# 규칙 2: [추가] 테라폼 실행 및 관리용 외부 EC2의 접근 허용 (★핵심)
+
+# 이 서브넷이 완벽한 Private 존이기 때문에, 외부 EC2에서 라우팅이 되려면
+
+# 아래 하이디SQL 가이드(터널링)를 쓰거나, VPC 피어링/VPN이 필요합니다.
+
+# 일단 실습 편의성을 위해 명시적으로 열어둡니다.
+
+ingress {
+from_port   = 3306
+to_port     = 3306
+protocol    = "tcp"
+cidr_blocks = ["13.209.130.5/32"]
+description = "Allow access from External Management EC2"
+}
+
+egress {
+from_port   = 0
+to_port     = 0
+protocol    = "-1"
+cidr_blocks = ["0.0.0.0/0"]
+}
+tags = { Name = "rds-security-group" }
+}
+
+# ==========================================
+# [4] DBA 관리형 파라미터 그룹 (문법 수정 버전)
+# ==========================================
+resource "aws_db_parameter_group" "mydb_pg" {
+  name        = "standard-rds-mysql84-pg"
+  family      = "mysql8.4"
+  description = "DBA Managed Standard Parameter Group"
+
+  parameter {
+    name  = "character_set_server"
+    value = "utf8mb4"
+  }
+
+  parameter {
+    name  = "character_set_client"
+    value = "utf8mb4"
+  }
+
+  parameter {
+    name  = "character_set_connection"
+    value = "utf8mb4"
+  }
+
+  parameter {
+    name  = "character_set_database"
+    value = "utf8mb4"
+  }
+
+  parameter {
+    name  = "character_set_results"
+    value = "utf8mb4"
+  }
+
+  parameter {
+    name  = "collation_server"
+    value = "utf8mb4_unicode_ci"
+  }
+
+  parameter {
+    name  = "collation_connection"
+    value = "utf8mb4_unicode_ci"
+  }
+
+  parameter {
+    name  = "interactive_timeout"
+    value = "3600"
+  }
+
+  parameter {
+    name  = "wait_timeout"
+    value = "3600"
+  }
+
+  parameter {
+    name  = "lock_wait_timeout"
+    value = "10"
+  }
+
+  parameter {
+    name  = "long_query_time"
+    value = "3"
+  }
+
+  parameter {
+    name  = "slow_query_log"
+    value = "1"
+  }
+
+  parameter {
+    name  = "log_bin_trust_function_creators"
+    value = "1"
+  }
+
+  parameter {
+    name  = "log_error_verbosity"
+    value = "2"
   }
 }
 
-resource "aws_route_table_association" "web_assoc" {
-  subnet_id      = aws_subnet.pub_web.id
-  route_table_id = aws_route_table.pub_rt.id
+# ==========================================
+
+# [5] 데이터베이스 본체 생성
+
+# ==========================================
+
+resource "aws_db_instance" "poc_mysql" {
+allocated_storage      = 20
+engine                 = "mysql"
+engine_version         = "8.4.7"
+instance_class         = "db.t4g.micro"
+db_name                = "pocdb"
+username               = "admin"
+password               = "password123"
+
+db_subnet_group_name   = aws_db_subnet_group.poc_db_group.name
+vpc_security_group_ids = [aws_security_group.rds_sg.id]
+parameter_group_name   = aws_db_parameter_group.mydb_pg.name
+
+# [DBA 운영 표준 옵션]
+
+publicly_accessible        = false # 인터넷망 노출 절대 차단
+apply_immediately          = false # 기습적인 자동 재부팅 방지 (수동 제어)
+auto_minor_version_upgrade = false # AWS 임의 마이너 패치 방지
+
+# [백업 보존 설정]
+
+backup_retention_period = 1             # 1일간 백업 보존(프리티어 최적화)
+backup_window           = "17:00-17:30" # 한국 시간 새벽 2시~2시 반 백업 수행
+
+
+
+skip_final_snapshot = true
+tags                = { Name = "standard-mysql-instance" }
 }
 
-# [5] 보안 그룹 (계층별 철저한 통제)
-# 5-1. Web+App SG: 외부에서 80 포트만 허용
-resource "aws_security_group" "web_sg" {
-  name   = "web-app-sg"
-  vpc_id = aws_vpc.main.id
-  ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-  
-  ingress {
-	  from_port   = 22
-	  to_port     = 22
-	  protocol    = "tcp"
-	  cidr_blocks = ["58.234.227.226/32"] # 본인 공인 IP 입력
-	}
-
-  egress { 
-	from_port = 0
-	to_port = 0
-	protocol = "-1"
-	cidr_blocks = ["0.0.0.0/0"]
-	}
+output "rds_endpoint" {
+value = aws_db_instance.poc_mysql.endpoint
 }
-
-# 5-2. Transaction SG: 오직 Web+App SG로부터 오는 트래픽만 허용
-resource "aws_security_group" "trans_sg" {
-  name   = "trans-sg"
-  vpc_id = aws_vpc.main.id
-  ingress {
-    from_port       = 8080 # Backend 서비스 포트
-    to_port         = 8080
-    protocol        = "tcp"
-    security_groups = [aws_security_group.web_sg.id] # 'Web' 출입증 확인
-  }
-  
-  ingress {
-	  from_port       = 22
-	  to_port         = 22
-	  protocol        = "tcp"
-	  security_groups = [aws_security_group.web_sg.id] # Web 서버에서 오는 SSH만 허용
-	}
-
-  egress { 
-	from_port = 0
-	to_port = 0
-	protocol = "-1"
-	cidr_blocks = ["0.0.0.0/0"]
-	}
-}
-
-# 5-3. Backup SG: DB 접근을 위한 관리용 그룹
-resource "aws_security_group" "backup_sg" {
-  name   = "backup-sg"
-  vpc_id = aws_vpc.main.id
-  
-  ingress {
-	  from_port       = 22
-	  to_port         = 22
-	  protocol        = "tcp"
-	  security_groups = [aws_security_group.web_sg.id] # Web 서버에서 오는 SSH만 허용
-	}
-
-  egress {
-	from_port = 0
-	to_port = 0
-	protocol = "-1"
-	cidr_blocks = ["0.0.0.0/0"]
-	}
-}
-
-# 5-4. DB SG: Transaction 서버와 Backup 서버만 3306 접근 가능
-resource "aws_security_group" "db_sg" {
-  name   = "db-sg"
-  vpc_id = aws_vpc.main.id
-  ingress {
-    from_port       = 3306
-    to_port         = 3306
-    protocol        = "tcp"
-    security_groups = [aws_security_group.trans_sg.id, aws_security_group.backup_sg.id]
-  }
-  
-  egress { 
-	from_port = 0
-	to_port = 0
-	protocol = "-1"
-	cidr_blocks = ["0.0.0.0/0"]
-  }
-}
-
-# [6] IAM 설정 (Backup EC2의 S3 권한)
-resource "aws_iam_role" "backup_role" {
-  name = "backup-s3-role"
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{ Action = "sts:AssumeRole", Effect = "Allow", Principal = { Service = "ec2.amazonaws.com" } }]
-  })
-}
-
-resource "aws_iam_role_policy_attachment" "s3_access" {
-  role       = aws_iam_role.backup_role.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonS3FullAccess"
-}
-
-resource "aws_iam_instance_profile" "backup_profile" {
-  name = "backup-instance-profile"
-  role = aws_iam_role.backup_role.name
-}
-
-# [7] RDS 배포
-resource "aws_db_subnet_group" "db_grp" {
-  name       = "db-subnet-group"
-  subnet_ids = [aws_subnet.pri_db_a.id, aws_subnet.pri_db_c.id]
-}
-
-resource "aws_db_instance" "rds" {
-  allocated_storage      = 20
-  engine                 = "mysql"
-  instance_class         = "db.t3.micro"
-  db_name                = "mydb"
-  username               = "admin"
-  password               = "password123!" # 실무에선 변수 처리 권장
-  db_subnet_group_name   = aws_db_subnet_group.db_grp.name
-  vpc_security_group_ids = [aws_security_group.db_sg.id]
-  skip_final_snapshot    = true
-  
-  publicly_accessible = false
-  multi_az            = false  # 프리티어 명시
-}
-
-# [8] EC2 배포 (Web+App, Transaction, Backup)
-data "aws_ami" "amazon_linux" {
-  most_recent = true
-  owners      = ["amazon"]
-  filter { 
-	name = "name"
-	values = ["al2023-ami-*-x86_64"]
-  }
-}
-
-resource "aws_instance" "web" {
-  ami           = data.aws_ami.amazon_linux.id
-  instance_type = "t3.micro"
-  subnet_id     = aws_subnet.pub_web.id
-  vpc_security_group_ids = [aws_security_group.web_sg.id]
-  
-  # [추가] 내가 가진 키 페어 이름을 적어주세요!
-  key_name      = "sunone_key"
-  
-  tags = { Name = "EC2-Web-App" }
-}
-
-resource "aws_instance" "trans" {
-  ami           = data.aws_ami.amazon_linux.id
-  instance_type = "t3.micro"
-  subnet_id     = aws_subnet.pri_trans.id
-  iam_instance_profile = aws_iam_instance_profile.backup_profile.name
-  vpc_security_group_ids = [aws_security_group.trans_sg.id]
-  
-  # [추가] 내가 가진 키 페어 이름을 적어주세요!
-  key_name      = "sunone_key"
-  
-  tags = { Name = "EC2-Transaction" }
-}
-
-resource "aws_instance" "backup" {
-  ami           = data.aws_ami.amazon_linux.id
-  instance_type = "t3.micro"
-  # subnet_id     = aws_subnet.pri_trans.id # 관리용이므로 Private에 배치 (재미나이)
-  subnet_id = aws_subnet.pri_db_a.id  # DB 서브넷으로 변경 (클로드)
-  iam_instance_profile = aws_iam_instance_profile.backup_profile.name
-  vpc_security_group_ids = [aws_security_group.backup_sg.id]
-  
-  # [추가] 내가 가진 키 페어 이름을 적어주세요!
-  key_name      = "sunone_key"
-  
-  tags = { Name = "EC2-Backup-Worker" }
-}
-
-# [9] S3 & VPC 엔드포인트 (내부 백업망)
-resource "aws_s3_bucket" "backup_store" {
-  bucket = "sunone-backup-test-bucket-20260420" # 유니크한 이름 필수
-}
-
-resource "aws_vpc_endpoint" "s3_ep" {
-  vpc_id       = aws_vpc.main.id
-  service_name = "com.amazonaws.ap-northeast-2.s3"
-
-  # [수정] 우리가 만든 Public RT와 VPC 기본 RT 둘 다에 연결!
-  route_table_ids = [
-    aws_vpc.main.default_route_table_id, # Private 서브넷들이 사용하는 길
-    aws_route_table.pub_rt.id            # Public 서브넷이 사용하는 길
-  ]
-  
-  tags = { Name = "s3-gateway-endpoint" }
-}
-
-
